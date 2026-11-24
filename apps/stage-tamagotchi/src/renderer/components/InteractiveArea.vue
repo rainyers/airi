@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import type { ChatToolCallRendererRegistry, ChatToolCallWidgetRegistry } from '@proj-airi/stage-ui/components'
 import type { ChatHistoryReplyPayload, ChatImageAttachment } from '@proj-airi/stage-ui/components/scenarios/chat'
 import type { ChatToolCallRerunEvent } from '@proj-airi/stage-ui/stores/tool-call-rerun'
@@ -11,7 +11,7 @@ import { errorMessageFrom } from '@moeru/std'
 import { useElectronEventaInvoke } from '@proj-airi/electron-vueuse'
 import { useChatInterruption } from '@proj-airi/stage-layouts/composables/use-chat-interruption'
 import { ChatBackgroundTasks, ChatHistory, JournalPreviewModal } from '@proj-airi/stage-ui/components'
-import { ChatImageAttachmentPreview, ChatProviderSetupCallout, ChatReplyPreview, ChatSendButton, useChatComposer, useChatImages, VoiceInputButton } from '@proj-airi/stage-ui/components/scenarios/chat'
+import { ChatArchivedSessionCallout, ChatImageAttachmentPreview, ChatProviderSetupCallout, ChatReplyPreview, ChatSendButton, useChatComposer, useChatImages, VoiceInputButton } from '@proj-airi/stage-ui/components/scenarios/chat'
 import { useAnalytics } from '@proj-airi/stage-ui/composables/use-analytics'
 import { useLlmToolsStore } from '@proj-airi/stage-ui/stores/ai/chat-llm/tools'
 import { useBackgroundStore } from '@proj-airi/stage-ui/stores/background'
@@ -21,7 +21,7 @@ import { useChatStreamStore } from '@proj-airi/stage-ui/stores/chat/stream-store
 import { useJournalPreviewStore } from '@proj-airi/stage-ui/stores/journal-preview'
 import { useAiriCardStore } from '@proj-airi/stage-ui/stores/modules/airi-card'
 import { BasicTextarea, DropdownMenu, GhostButton } from '@proj-airi/ui'
-import { until, useAsyncState, useLocalStorage } from '@vueuse/core'
+import { until, useAsyncState, useElementSize, useLocalStorage } from '@vueuse/core'
 import { nanoid } from 'nanoid/non-secure'
 import { storeToRefs } from 'pinia'
 import { computed, nextTick, onMounted, ref, shallowRef, toRaw, useTemplateRef, watch } from 'vue'
@@ -101,6 +101,9 @@ const solidSurfaces = computed(() => props.floating && !props.glassBackdrop)
 /** Whether a foldable composer is folded away. */
 const composerFolded = defineModel<boolean>('composerFolded', { default: false })
 const viewportLayout = useTemplateRef<InstanceType<typeof ChatViewportLayout>>('viewport-layout')
+// A narrow chat has no room for two sides. All messages then start at the left, like a messenger in a narrow window.
+const { width: viewportWidth } = useElementSize(() => viewportLayout.value?.$el as HTMLElement | undefined)
+const narrowHistory = computed(() => viewportWidth.value > 0 && viewportWidth.value < 520)
 
 const messageComposer = useTemplateRef<HTMLDivElement>('message-composer')
 const voiceStatus = useTemplateRef<HTMLDivElement>('voice-status')
@@ -123,7 +126,7 @@ const { activeSessionId, messages } = storeToRefs(chatSession)
 const { streamingMessage } = storeToRefs(chatStream)
 const { activeTurns, backgroundTasks } = storeToRefs(chatStore)
 const { activeCard, activeCardId } = storeToRefs(airiCardStore)
-const { activeChatReady: chatReady } = storeToRefs(chatStore)
+const { activeChatReady: chatReady, activeChatArchived: chatArchived } = storeToRefs(chatStore)
 const { t } = useI18n()
 const openSettings = useElectronEventaInvoke(electronOpenSettings)
 const startLogin = useElectronEventaInvoke(electronAuthStartLogin)
@@ -156,7 +159,7 @@ const { state: computerUseGrantMode, executeImmediate: refreshComputerUseGrant, 
   'ask' satisfies ApprovalGrantMode,
   { immediate: false },
 )
-const approvalMenuActive = computed(() => commandGrantMode.value === 'full' || computerUseGrantMode.value === 'full')
+const approvalMenuActive = computed(() => commandGrantMode.value !== 'ask' || computerUseGrantMode.value !== 'ask')
 const loadingApproval = computed(() => loadingCommandGrant.value || loadingComputerUseGrant.value)
 const changingApprovalLane = ref<'terminal' | 'computer_use' | null>(null)
 const approvalError = ref('')
@@ -177,12 +180,24 @@ async function refreshApproval(sessionId: string | undefined) {
 
 async function changeApprovalGrant(lane: 'terminal' | 'computer_use', mode: ApprovalGrantMode) {
   const sessionId = activeSessionId.value
-  if (!sessionId || changingApprovalLane.value || loadingApproval.value || mode === 'auto')
+  if (!sessionId) {
+    approvalError.value = t('tamagotchi.stage.chat-window.computer-tools.approval-session-unavailable')
+    return
+  }
+  if (changingApprovalLane.value || loadingApproval.value)
     return
   changingApprovalLane.value = lane
   approvalError.value = ''
   try {
-    await setSessionApprovalGrant({ sessionId, lane, mode })
+    const result = await setSessionApprovalGrant({ sessionId, lane, mode })
+    if (typeof result === 'object' && result !== null && 'unavailableReason' in result) {
+      const message = result.unavailableReason === 'workspace_unavailable'
+        ? 'approval-command-auto-unavailable'
+        : result.unavailableReason === 'foreground_unavailable'
+          ? 'approval-computer-use-auto-foreground-unavailable'
+          : 'approval-computer-use-auto-foreground-denied'
+      approvalError.value = t(`tamagotchi.stage.chat-window.computer-tools.${message}`)
+    }
   }
   catch (error) {
     approvalError.value = errorMessageFrom(error) ?? t('tamagotchi.stage.chat-window.computer-tools.approval-error')
@@ -256,8 +271,8 @@ const { showStopAction, stopActiveResponse, submitInterruptingResponse } = useCh
 })
 
 async function handleSend() {
-  // The draft stays in the composer while the setup callout is shown.
-  if (voiceActive.value || pendingImages.value || !chatReady.value)
+  // The draft stays in the composer while the setup callout or the archived callout is shown.
+  if (voiceActive.value || pendingImages.value || !chatReady.value || chatArchived.value)
     return
 
   // A waiting voice message takes the composer text into the same user message.
@@ -328,7 +343,7 @@ const visibleStreamingMessage = streamingMessage
 
 async function handleDeleteMessage(payload: { message: ChatHistoryItem, index: number }) {
   const { index, message } = payload
-  await chatSession.deleteMessage({
+  await chatStore.deleteMessage({
     sessionId: chatSession.activeSessionId,
     index,
   })
@@ -464,35 +479,6 @@ defineExpose({
     :composer-at-edge="props.composerFoldable"
   >
     <template #history="{ tailInset }">
-      <!--
-        The welcome card centers in the space above the composer, which covers
-        the bottom of the history. The container query below drops the icon,
-        then the description, when that space is too short for them.
-        The history scroller fills the layer and comes later, so the container
-        sits above it and passes the pointer through. The floating card paints
-        its own surface, so it takes the pointer, and the hit test of the
-        transparent window finds it.
-      -->
-      <div
-        v-if="!historyMessages.some(message => message.role !== 'system') && !isActiveSessionSending"
-        :class="['chat-empty-state pointer-events-none absolute inset-x-0 top-0 z-1 flex items-center justify-center overflow-hidden px-6']"
-        :style="{ bottom: `calc(${tailInset}px + 1rem)` }"
-      >
-        <div
-          :class="[
-            'flex flex-col items-center gap-3 text-center',
-            solidSurfaces ? 'pointer-events-auto rounded-2xl bg-white px-6 py-6 shadow-md dark:bg-neutral-900' : '',
-          ]"
-        >
-          <div :class="['chat-empty-state-icon size-14 flex items-center justify-center rounded-2xl bg-primary-100/60 text-primary-500 dark:bg-primary-900/30']">
-            <span :class="['i-solar:chat-line-bold-duotone size-7']" />
-          </div>
-          <span :class="['font-cute text-xl text-neutral-700 dark:text-neutral-200']">{{ assistantLabel || 'AIRI' }}</span>
-          <p :class="['chat-empty-state-description text-sm text-neutral-500 dark:text-neutral-400']">
-            {{ t('stage.chat.images.empty') }}
-          </p>
-        </div>
-      </div>
       <ChatHistory
         :messages="historyMessages"
         :assistant-label="assistantLabel"
@@ -504,9 +490,11 @@ defineExpose({
         :surface="solidSurfaces ? 'opaque' : 'translucent'"
         :scrollbar="props.floating ? 'hover' : 'scroll'"
         :passive="props.passive"
+        :align-user-start="narrowHistory"
         :class="['transition-[padding] duration-300 ease-out motion-reduce:transition-none', props.dockSide && { left: 'pl-12', right: 'pr-12' }[props.dockSide]]"
         :style="props.rightResizeBand ? { width: `calc(100% - ${props.rightResizeBand}px)` } : undefined"
         :expired-before="props.expiredBefore"
+        :readonly="chatArchived"
         @delete-message="handleDeleteMessage"
         @reply-message="handleReplyMessage"
         @retry-message="handleRetryMessage($event.index)"
@@ -536,6 +524,7 @@ defineExpose({
         @configure="openSettings({ route: '/settings/providers' })"
         @sign-in="startLogin()"
       />
+      <ChatArchivedSessionCallout v-else-if="chatArchived" :class="['mx-2 mb-1']" />
       <div
         ref="message-composer"
         :class="[
@@ -548,8 +537,9 @@ defineExpose({
           solidSurfaces
             ? 'border border-neutral-200 bg-white p-2 dark:border-neutral-800 dark:bg-neutral-900'
             : [
-              'bg-neutral-100/70 p-2 backdrop-blur-xl dark:bg-neutral-900/65',
-              'transition-colors duration-200 ease-out focus-within:bg-neutral-100 dark:focus-within:bg-neutral-900 motion-reduce:transition-none',
+              // The composer is a step lighter than the chat surface in dark mode, so it stands out on the solid chat.
+              'bg-neutral-100/70 p-2 backdrop-blur-xl dark:bg-neutral-800/70',
+              'transition-colors duration-200 ease-out focus-within:bg-neutral-100 dark:focus-within:bg-neutral-800 motion-reduce:transition-none',
             ],
         ]"
       >
@@ -562,7 +552,7 @@ defineExpose({
           <ChatBackgroundTasks :tasks="backgroundTasks" @stop="task => chatStore.stopBackgroundTask(task.sessionId)" @dismiss="task => chatStore.dismissBackgroundTask(task.sessionId)" />
           <div ref="voice-attachment" :class="['px-2 pt-1 empty:hidden']" />
           <!-- Journal Preview Chips -->
-          <div v-if="latestImageEntries.length > 0" class="flex gap-2 overflow-x-auto px-2 py-1 scrollbar-none">
+          <div v-if="latestImageEntries.length > 0" :class="['flex gap-2 overflow-x-auto px-2 py-1', 'scrollbar-none']">
             <div
               v-for="entry in latestImageEntries"
               :key="entry.id"
@@ -573,9 +563,9 @@ defineExpose({
               ]"
               @click="openImagePreview(entry)"
             >
-              <img :src="entry.url || ''" class="h-full w-full object-cover">
+              <img :src="entry.url || ''" :class="['h-full w-full object-cover']">
               <div :class="['absolute inset-0 flex items-end p-1', 'bg-gradient-to-t from-black/60 to-transparent']">
-                <span class="truncate text-[8px] text-white font-medium">{{ entry.title }}</span>
+                <span :class="['truncate text-[8px] font-medium', 'text-white']">{{ entry.title }}</span>
               </div>
 
               <!-- Save Button (Top Right, Hover Only) -->
@@ -587,7 +577,7 @@ defineExpose({
                 title="Save to computer"
                 @click.stop="journalPreviewStore.downloadImage(entry.url || '', entry.title)"
               >
-                <div class="i-solar:download-minimalistic-bold-duotone text-[10px]" />
+                <div :class="['i-solar:download-minimalistic-bold-duotone text-[10px]']" />
               </button>
             </div>
           </div>
@@ -649,6 +639,7 @@ defineExpose({
             <template #trigger>
               <GhostButton
                 size="unset"
+                data-testid="approval-menu-trigger"
                 :class="['size-9']"
                 :active="approvalMenuActive"
                 :aria-label="approvalMenuActive ? t('tamagotchi.stage.chat-window.computer-tools.approval-active') : t('tamagotchi.stage.chat-window.computer-tools.label')"
@@ -776,23 +767,6 @@ defineExpose({
 @media (prefers-reduced-motion: reduce) {
   .chat-composer-foldable {
     transition: none;
-  }
-}
-
-.chat-empty-state {
-  container-type: size;
-}
-
-/* The card needs about 11rem with the icon and 5rem with the description. */
-@container (max-height: 12rem) {
-  .chat-empty-state-icon {
-    display: none;
-  }
-}
-
-@container (max-height: 6rem) {
-  .chat-empty-state-description {
-    display: none;
   }
 }
 </style>
